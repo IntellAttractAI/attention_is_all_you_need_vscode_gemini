@@ -1,0 +1,33 @@
+# For PyTorch and TorchText
+# Make sure to install the correct PyTorch version for your CUDA setup if using GPU.
+# Visit https://pytorch.org/get-started/locally/ for instructions.
+
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+torchtext==0.17.2
+torchdata==0.7.1
+
+# For MLflow (experiment tracking)
+mlflow
+
+# For Streamlit (web app)
+streamlit
+
+# For Hugging Face Hub
+huggingface_hub
+
+# For BLEU score calculation (benchmarking)
+sacremoses # Often used by torchtext.metrics or other libraries for BLEU
+torchmetrics # Provides a BLEU score metric
+
+# Add other specific versions if needed, e.g.:
+# numpy==<version>
+# matplotlib==<version>
+# streamlit==<version>
+# pandas==<version>
+
+# Added spacy itself
+spacy
+
+portalocker>=2.0.0
