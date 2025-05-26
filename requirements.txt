@@ -2,11 +2,11 @@
 # Make sure to install the correct PyTorch version for your CUDA setup if using GPU.
 # Visit https://pytorch.org/get-started/locally/ for instructions.
 
-torch==2.5.0
-torchvision==0.21.0
-torchaudio==2.6.0
-torchtext==0.18.0
-torchdata==0.7.1
+torch==2.3.1
+torchvision==0.18.1 # Compatible with torch 2.3.x
+torchaudio==2.3.1  # Compatible with torch 2.3.x
+torchtext==0.17.1 # Compatible with torch 2.3.x, has cp311 wheels
+torchdata==0.7.1  # Compatible with torch 2.3.x, has cp311 wheels
 
 # For MLflow (experiment tracking)
 mlflow
