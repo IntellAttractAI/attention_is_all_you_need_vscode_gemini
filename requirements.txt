@@ -2,10 +2,10 @@
 # Make sure to install the correct PyTorch version for your CUDA setup if using GPU.
 # Visit https://pytorch.org/get-started/locally/ for instructions.
 
-torch==2.2.2
-torchvision==0.17.2
-torchaudio==2.2.2
-torchtext==0.17.2
+torch==2.5.0
+torchvision==0.20.0
+torchaudio==2.5.0
+torchtext==0.18.0
 torchdata==0.7.1
 
 # For MLflow (experiment tracking)
