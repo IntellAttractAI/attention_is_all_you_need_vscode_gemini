@@ -3,8 +3,8 @@
 # Visit https://pytorch.org/get-started/locally/ for instructions.
 
 torch==2.5.0
-torchvision==0.20.0
-torchaudio==2.5.0
+torchvision==0.21.0
+torchaudio==2.3.0 # Adjusted to a version commonly paired with torch 2.5
 torchtext==0.18.0
 torchdata==0.7.1
 
