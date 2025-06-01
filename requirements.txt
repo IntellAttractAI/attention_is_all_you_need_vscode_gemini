@@ -2,11 +2,12 @@
 # Make sure to install the correct PyTorch version for your CUDA setup if using GPU.
 # Visit https://pytorch.org/get-started/locally/ for instructions.
 
+
 torch==2.5.0
-torchvision==0.21.0
-torchaudio==2.6.0
-torchtext==0.18.0
-torchdata==0.7.1
+torchvision # Let pip choose a version compatible with torch==2.5.0
+torchaudio  # Let pip choose a version compatible with torch==2.5.0
+torchtext==0.18.0 # Requires torch==2.5.0
+torchdata==0.7.1 # Keeping this version for now, can also be unpinned if it causes issues
 
 # For MLflow (experiment tracking)
 mlflow
@@ -31,3 +32,4 @@ torchmetrics # Provides a BLEU score metric
 spacy
 
 portalocker>=2.0.0
+
