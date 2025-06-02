@@ -5,6 +5,36 @@ import torch.nn.functional as F
 import math
 import copy
 
+def generate_square_subsequent_mask(sz, device="cpu"):
+    """Generates a square mask for the sequence. The masked positions are filled with float('-inf').
+    Unmasked positions are filled with float(0.0).
+    """
+    mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    return mask
+
+def create_padding_mask(seq, pad_token_idx, device="cpu"):
+    """
+    Creates a mask for padding tokens.
+    Output shape: (batch_size, 1, seq_len) for use in attention mechanisms.
+    Mask values are True for non-pad tokens and False for pad tokens.
+    This is then typically used to zero out attention scores for pad tokens.
+    For some attention implementations, you might need (batch_size, seq_len).
+    The Transformer class provided seems to expect (batch_size, 1, 1, seq_len) or (batch_size, 1, seq_len, seq_len)
+    Let's adjust to (batch_size, 1, seq_len) which is common for key_padding_mask.
+    The model's forward pass might need further adjustment based on how it uses this.
+    The provided Transformer's MultiHeadAttention expects mask of shape (batch_size, num_heads, seq_len_q, seq_len_k)
+    or (batch_size, 1, 1, seq_len) for padding if it's broadcast.
+    Let's stick to (batch_size, 1, seq_len) and see how it's used.
+    The model.py provided by user has:
+    # src_mask: (B, 1, S_src)
+    # tgt_mask: (B, S_tgt, S_tgt)
+    So, (B, 1, S) is the target for padding masks.
+    """
+    # seq: (batch_size, seq_len)
+    mask = (seq != pad_token_idx).unsqueeze(1).to(device) # (batch_size, 1, seq_len)
+    return mask
+
 class PositionalEncoding(nn.Module):
     """
     Implements the sinusoidal positional encoding.
@@ -330,24 +360,6 @@ def generate_square_subsequent_mask(sz: int, device: torch.device = torch.device
     """
     mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1) 
     return mask == 0 # True for non-masked, False for masked (upper triangle)
-
-def create_padding_mask(seq: torch.Tensor, pad_idx: int) -> torch.Tensor:
-    """
-    Creates a mask for padding tokens.
-    Args:
-        seq: Tensor of shape (batch_size, seq_len)
-        pad_idx: Index of the padding token.
-    Returns:
-        mask: Tensor of shape (batch_size, 1, 1, seq_len) for MHA, or (batch_size, 1, seq_len)
-              True for non-pad tokens, False for pad tokens.
-    """
-    # seq_pad_mask = (seq != pad_idx).unsqueeze(1).unsqueeze(2) # (batch_size, 1, 1, seq_len)
-    # My MHA expects (batch_size, 1, seq_len_q, seq_len_k) or similar.
-    # For self-attention, src_mask is (B, 1, S) or (B, S, S).
-    # For encoder-decoder attention, memory_mask is (B, 1, S_src)
-    # Let's return (B, 1, S_len)
-    mask = (seq != pad_idx).unsqueeze(1) # (batch_size, 1, seq_len)
-    return mask
 
 
 if __name__ == '__main__':

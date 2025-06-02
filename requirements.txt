@@ -1,9 +1,8 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.3.1
-torchvision==0.18.1
-torchaudio==2.3.1
-torchtext==0.17.1
-torchdata==0.7.1 # This version is compatible with torch 2.3.x
+torch==2.7.0
+torchvision==0.22.0 # Compatible with torch 2.7.x
+torchaudio==2.7.0  # Compatible with torch 2.7.x
+torchdata==0.7.1 # Compatible with recent torch versions
 
 # For MLflow (experiment tracking)
 mlflow
@@ -13,16 +12,11 @@ streamlit
 
 # For Hugging Face Hub
 huggingface_hub
+datasets
 
 # For BLEU score calculation (benchmarking)
-sacremoses # Often used by torchtext.metrics or other libraries for BLEU
-torchmetrics # Provides a BLEU score metric
-
-# Add other specific versions if needed, e.g.:
-# numpy==<version>
-# matplotlib==<version>
-# streamlit==<version>
-# pandas==<version>
+sacremoses
+torchmetrics
 
 # Added spacy itself
 spacy

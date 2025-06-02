@@ -1,389 +1,440 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
-from torchtext.datasets import Multi30k
-from torchtext.data.utils import get_tokenizer
-from torchtext.vocab import build_vocab_from_iterator
+import spacy
+import os
+import json
+# Ensure your model.py has Transformer, generate_square_subsequent_mask, create_padding_mask
 from model import Transformer, generate_square_subsequent_mask, create_padding_mask
-import mlflow
-import mlflow.pytorch
-import time
 import math
+import time
+from tqdm import tqdm
+import random
+from datasets import load_dataset # Added for Hugging Face Datasets
 
 # --- Configuration ---
-SRC_LANGUAGE = 'de' # Paper uses En-De and En-Fr. Multi30k has En-De.
-TRG_LANGUAGE = 'en' # Let's try German to English for Multi30k
-# For WMT14 En-Fr as per paper, you'd need a different dataset loader.
-
-# Model Hyperparameters (matches paper's base model)
-D_MODEL = 512
-NUM_ENCODER_LAYERS = 6
-NUM_DECODER_LAYERS = 6
-NUM_HEADS = 8
-D_FF = 2048
-DROPOUT = 0.1
-MAX_SEQ_LEN = 100 # Max sequence length for positional encoding & batching
-
-# Training Hyperparameters
-BATCH_SIZE = 128 # Paper uses ~25000 tokens per batch. This is sentence-based.
-                  # For Multi30k, 128 sentences is a common starting point.
-LEARNING_RATE = 0.0001 # Will be controlled by Adam optimizer with custom schedule
-WARMUP_STEPS = 4000
-EPOCHS = 20 # Paper trains for 100k steps (base) or 300k steps (big)
-              # For Multi30k, 10-20 epochs is a common starting point.
-PAD_IDX = 0 # Will be set by vocab
-BOS_IDX = 1 # Will be set by vocab
-EOS_IDX = 2 # Will be set by vocab
-UNK_IDX = 3 # Will be set by vocab
-
-MLFLOW_EXPERIMENT_NAME = "Transformer_AttentionIsAllYouNeed"
-
-# Determine device
+# Configure device for Apple Silicon (M1/M2/M3/M4) to use Metal Performance Shaders (MPS)
 if torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-    print("Using Apple Silicon (MPS) backend.")
+    DEVICE = torch.device('mps')
+    print("Using Apple Silicon GPU (MPS)")
 elif torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-    print("Using CUDA backend.")
+    DEVICE = torch.device('cuda')
+    print("Using CUDA GPU")
 else:
-    DEVICE = torch.device("cpu")
-    print("Using CPU backend.")
+    DEVICE = torch.device('cpu')
+    print("Using CPU")
 
-# --- Tokenizers and Vocabulary ---
-# Using basic tokenizers for simplicity. Paper uses byte-pair encoding (BPE) or word-piece.
-# For production, use SentencePiece or a similar subword tokenizer.
-token_transform = {}
-de_tokenizer = get_tokenizer('spacy', language='de_core_news_sm')
-en_tokenizer = get_tokenizer('spacy', language='en_core_web_sm')
-token_transform[SRC_LANGUAGE] = de_tokenizer
-token_transform[TRG_LANGUAGE] = en_tokenizer
+# Dataset Configuration (WMT14 from Hugging Face)
+DATASET_NAME = "wmt14"
+DATASET_CONFIG = "de-en" # German-English pair
+
+# Paths for saving models and vocabs (specific to WMT14)
+MODEL_SAVE_PATH = "transformer_model_wmt14_epoch_{epoch}.pth"
+VOCAB_SRC_FILE_NAME = "vocab_src_wmt14.json"
+VOCAB_TGT_FILE_NAME = "vocab_tgt_wmt14.json"
+VOCAB_SAVE_DIR = "." # Save vocabs in the current project directory
+
+# Languages and Spacy Models
+SRC_LANGUAGE = 'de'
+TGT_LANGUAGE = 'en'
+# Ensure these spacy models are downloaded or listed in requirements.txt for cloud environments
+SRC_LANGUAGE_MODEL = "de_core_news_sm"
+TGT_LANGUAGE_MODEL = "en_core_web_sm"
+
+# Model Hyperparameters (optimized for fast development on M4 MacBook)
+SRC_VOCAB_SIZE = 0 # Will be set after loading/building vocab
+TGT_VOCAB_SIZE = 0 # Will be set after loading/building vocab
+EMB_SIZE = 256 # Reduced from 512 for faster training
+NHEAD = 4 # Reduced from 8 for faster training
+FFN_HID_DIM = 512 # Reduced from 2048 for faster training
+NUM_ENCODER_LAYERS = 3 # Reduced from 6 for faster training
+NUM_DECODER_LAYERS = 3 # Reduced from 6 for faster training
+DROPOUT = 0.1
+MAX_SEQ_LEN_CONFIG = 5000 # For Transformer model's PositionalEncoding
+
+# Training Hyperparameters (optimized for fast development)
+NUM_EPOCHS = 3 # Reduced for faster experimentation
+BATCH_SIZE = 64 # Increased for M4 MacBook GPU utilization (adjust if memory issues occur)
+LEARNING_RATE = 0.001 # Increased learning rate for faster convergence
+BETAS = (0.9, 0.98)
+EPS = 1e-9
+GRAD_CLIP_NORM = 1.0 # Gradient clipping value
+
+# Fast training optimizations
+MAX_SAMPLES_TRAIN = 50000 # Limit training samples for faster experimentation (set to None for full dataset)
+MAX_SAMPLES_VAL = 3000 # Limit validation samples
+VOCAB_MIN_FREQ = 20 # Increased from 5 to reduce vocabulary size significantly
+MAX_SEQ_LEN = 100 # Reduced from default for faster processing
+
+# Special token definitions
+UNK_TOKEN = '<unk>'
+PAD_TOKEN = '<pad>'
+BOS_TOKEN = '<bos>'
+EOS_TOKEN = '<eos>'
+SPECIAL_SYMBOLS = [UNK_TOKEN, PAD_TOKEN, BOS_TOKEN, EOS_TOKEN]
+
+# --- Helper Class for JSON Vocabularies ---
+class JsonVocab:
+    def __init__(self, vocab_data=None, stoi=None, itos=None):
+        if vocab_data:
+            self._stoi = vocab_data['stoi']
+            self._itos = vocab_data['itos']
+        elif stoi is not None and itos is not None:
+            self._stoi = stoi
+            self._itos = itos
+        else:
+            raise ValueError("Must provide either vocab_data or both stoi and itos.")
+
+        # Ensure special tokens are in stoi and get their indices
+        self.UNK_IDX = self._stoi.get(UNK_TOKEN)
+        self.PAD_IDX = self._stoi.get(PAD_TOKEN)
+        self.BOS_IDX = self._stoi.get(BOS_TOKEN)
+        self.EOS_IDX = self._stoi.get(EOS_TOKEN)
+
+        if None in [self.UNK_IDX, self.PAD_IDX, self.BOS_IDX, self.EOS_IDX]:
+            missing = [s for s, i in zip(SPECIAL_SYMBOLS, [self.UNK_IDX, self.PAD_IDX, self.BOS_IDX, self.EOS_IDX]) if i is None]
+            raise ValueError(f"Special tokens {missing} not found in vocabulary's stoi map.")
 
 
-# Helper to yield list of tokens
-def yield_tokens(data_iter, language):
-    language_index = {SRC_LANGUAGE: 0, TRG_LANGUAGE: 1}
-    for data_sample in data_iter:
-        yield token_transform[language](data_sample[language_index[language]])
+    def get_stoi(self):
+        return self._stoi
 
-# Build Vocabulary
-# Download and load Multi30k dataset
-# train_iter, val_iter, test_iter = Multi30k(split=('train', 'valid', 'test'))
-# Using new API for Multi30k
-# from torchtext.datasets import multi30k # This line can be removed if Multi30k is imported at the top
-# multi30k.URL["train"] = "https://raw.githubusercontent.com/multi30k/dataset/master/data/task1/raw/train.{}.gz"
-# multi30k.URL["valid"] = "https://raw.githubusercontent.com/multi30k/dataset/master/data/task1/raw/val.{}.gz"
-# multi30k.URL["test"] = "https://raw.githubusercontent.com/multi30k/dataset/master/data/task1/raw/test_2016_flickr.{}.gz"
-# multi30k.MD5["train"] = "20140d013d05dd9a72dfde464781a035ac7197697ea3f70e93d10201931a8df1"
-# multi30k.MD5["valid"] = "aef2f505686586959983846ae89f76883973f8330855127519b837d563372049"
-# multi30k.MD5["test"] = "713c33cf313a0acd9450039797595ec865003e9099b31750a47e660606524866"
+    def get_itos(self):
+        return self._itos
+
+    def __getitem__(self, token):
+        return self._stoi.get(token, self.UNK_IDX)
+
+    def __len__(self):
+        return len(self._itos)
+
+    @classmethod
+    def build_from_iterator(cls, iterator, specials, min_freq=VOCAB_MIN_FREQ): # Use optimized min_freq
+        counter = {}
+        # Wrap iterator with tqdm for progress display
+        for tokens in tqdm(iterator, desc="Counting tokens for vocab build"):
+            for token in tokens:
+                counter[token] = counter.get(token, 0) + 1
+        
+        stoi = {}
+        itos = list(specials) # Start with special symbols
+
+        for s_idx, s_tok in enumerate(specials):
+            stoi[s_tok] = s_idx
+        
+        # Sort tokens by frequency (descending), then alphabetically for tie-breaking
+        sorted_tokens = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+
+        for token, freq in tqdm(sorted_tokens, desc="Building vocab from sorted tokens"):
+            if freq >= min_freq and token not in stoi: # Add if freq is sufficient and not a special token
+                stoi[token] = len(itos)
+                itos.append(token)
+        return cls(stoi=stoi, itos=itos)
+
+# --- Data Loading and Preprocessing ---
+
+def limit_dataset_size(dataset, max_samples=None):
+    """Limit dataset size for faster experimentation"""
+    if max_samples is None:
+        return dataset
+    total_samples = len(dataset)
+    if total_samples <= max_samples:
+        return dataset
+    print(f"Limiting dataset from {total_samples} to {max_samples} samples for faster training")
+    return dataset.select(range(max_samples))
+
+# Load Spacy tokenizers
+try:
+    spacy_src = spacy.load(SRC_LANGUAGE_MODEL)
+    spacy_tgt = spacy.load(TGT_LANGUAGE_MODEL)
+except OSError:
+    print(f"Spacy models not found. Please run:\n"
+          f"python -m spacy download {SRC_LANGUAGE_MODEL}\n"
+          f"python -m spacy download {TGT_LANGUAGE_MODEL}\n"
+          f"Or ensure they are listed in requirements.txt for cloud environments.")
+    exit(1)
+
+token_transform = {
+    SRC_LANGUAGE: spacy_src.tokenizer,
+    TGT_LANGUAGE: spacy_tgt.tokenizer
+}
+
+# Load WMT14 dataset from Hugging Face
+print(f"Loading WMT14 dataset ('{DATASET_NAME}', config '{DATASET_CONFIG}'). This may take time for the first download...")
+try:
+    # Using trust_remote_code=True might be necessary for some datasets on the Hub
+    # For wmt14, it's generally not needed but good to be aware of.
+    wmt_dataset = load_dataset(DATASET_NAME, DATASET_CONFIG)
+except Exception as e:
+    print(f"Failed to load dataset {DATASET_NAME} with config {DATASET_CONFIG}: {e}")
+    print("Ensure you have an internet connection, the 'datasets' library is installed correctly,")
+    print("and the dataset identifier is correct. You might need 'trust_remote_code=True'.")
+    exit(1)
+
+def yield_tokens_from_hf_dataset(dataset_split, language_key, tokenizer_fn):
+    """Yields tokenized text from a Hugging Face dataset split."""
+    # Accessing the text: example['translation'][language_key]
+    for example in dataset_split: # No need for tqdm here, build_from_iterator will use it
+        text = example['translation'][language_key]
+        yield [token.text for token in tokenizer_fn(text.strip())]
+
+# Load or build vocabularies
+vocab_src_path = os.path.join(VOCAB_SAVE_DIR, VOCAB_SRC_FILE_NAME)
+vocab_tgt_path = os.path.join(VOCAB_SAVE_DIR, VOCAB_TGT_FILE_NAME)
+
+if os.path.exists(vocab_src_path) and os.path.exists(vocab_tgt_path):
+    print("Loading existing WMT14 vocabularies...")
+    with open(vocab_src_path, 'r', encoding='utf-8') as f:
+        vocab_src_data = json.load(f)
+    with open(vocab_tgt_path, 'r', encoding='utf-8') as f:
+        vocab_tgt_data = json.load(f)
+    vocab_src = JsonVocab(vocab_data=vocab_src_data)
+    vocab_tgt = JsonVocab(vocab_data=vocab_tgt_data)
+else:
+    print("Building WMT14 vocabularies from 'train' split...")
+    
+    src_token_iterator = yield_tokens_from_hf_dataset(wmt_dataset['train'], SRC_LANGUAGE, token_transform[SRC_LANGUAGE])
+    vocab_src = JsonVocab.build_from_iterator(src_token_iterator, SPECIAL_SYMBOLS)
+    
+    tgt_token_iterator = yield_tokens_from_hf_dataset(wmt_dataset['train'], TGT_LANGUAGE, token_transform[TGT_LANGUAGE])
+    vocab_tgt = JsonVocab.build_from_iterator(tgt_token_iterator, SPECIAL_SYMBOLS)
+
+    print(f"Saving source vocabulary to {vocab_src_path}")
+    with open(vocab_src_path, 'w', encoding='utf-8') as f:
+        json.dump({'stoi': vocab_src.get_stoi(), 'itos': vocab_src.get_itos()}, f, ensure_ascii=False, indent=4)
+    
+    print(f"Saving target vocabulary to {vocab_tgt_path}")
+    with open(vocab_tgt_path, 'w', encoding='utf-8') as f:
+        json.dump({'stoi': vocab_tgt.get_stoi(), 'itos': vocab_tgt.get_itos()}, f, ensure_ascii=False, indent=4)
+
+SRC_VOCAB_SIZE = len(vocab_src)
+TGT_VOCAB_SIZE = len(vocab_tgt)
+PAD_IDX = vocab_src.PAD_IDX # Get PAD_IDX from the loaded/built vocab
+
+print(f"Source Vocab Size (WMT14): {SRC_VOCAB_SIZE}")
+print(f"Target Vocab Size (WMT14): {TGT_VOCAB_SIZE}")
+print(f"PAD_IDX: {PAD_IDX}")
 
 
-# Load data iterators
-train_iter = Multi30k(split='train', language_pair=(SRC_LANGUAGE, TRG_LANGUAGE))
-val_iter = Multi30k(split='valid', language_pair=(SRC_LANGUAGE, TRG_LANGUAGE))
-# test_iter = Multi30k(split='test', language_pair=(SRC_LANGUAGE, TRG_LANGUAGE)) # Test set for 2016 flickr
+# Text transformation function
+def text_transform_fn(vocab, tokenizer_fn):
+    def func(text_input):
+        tokens = [token.text for token in tokenizer_fn(text_input.strip())]
+        return [vocab.BOS_IDX] + [vocab[token] for token in tokens] + [vocab.EOS_IDX]
+    return func
 
-# --- Limit dataset size for 10k training items ---
-# MAX_TRAIN_ITEMS = 10000
-# # Multi30k has ~1000 validation items. Let\'s maintain a similar ratio for val set.
-# # Original train: 29000, Original val: ~1014
-# # Ratio val/train = 1014/29000 = ~0.035
-# MAX_VAL_ITEMS = int(MAX_TRAIN_ITEMS * (1014 / 29000))
-# if MAX_VAL_ITEMS == 0: MAX_VAL_ITEMS = 1 # Ensure at least 1 item for validation
+text_transform_src = text_transform_fn(vocab_src, token_transform[SRC_LANGUAGE])
+text_transform_tgt = text_transform_fn(vocab_tgt, token_transform[TGT_LANGUAGE])
 
-full_train_list = list(train_iter)
-full_val_list = list(val_iter)
+class HFTranslationDataset(Dataset):
+    def __init__(self, hf_dataset_split, src_lang_key, tgt_lang_key, src_transform_fn, tgt_transform_fn):
+        self.dataset_split = hf_dataset_split
+        self.src_lang_key = src_lang_key
+        self.tgt_lang_key = tgt_lang_key
+        self.src_transform_fn = src_transform_fn
+        self.tgt_transform_fn = tgt_transform_fn
 
-# limited_train_list = full_train_list[:MAX_TRAIN_ITEMS]
-# limited_val_list = full_val_list[:MAX_VAL_ITEMS]
+    def __len__(self):
+        return len(self.dataset_split)
 
-# print(f"Using a subset of Multi30k: {len(limited_train_list)} training items, {len(limited_val_list)} validation items.")
-print(f"Using full Multi30k dataset: {len(full_train_list)} training items, {len(full_val_list)} validation items.")
-# --- End of dataset limiting ---
+    def __getitem__(self, idx):
+        example = self.dataset_split[idx]['translation']
+        src_text = example[self.src_lang_key]
+        tgt_text = example[self.tgt_lang_key]
+        
+        src_sample = self.src_transform_fn(src_text)
+        tgt_sample = self.tgt_transform_fn(tgt_text)
+        return torch.tensor(src_sample, dtype=torch.long), torch.tensor(tgt_sample, dtype=torch.long)
 
-
-# Define special symbols and indices
-UNK_IDX, PAD_IDX, BOS_IDX, EOS_IDX = 0, 1, 2, 3
-special_symbols = ['<unk>', '<pad>', '<bos>', '<eos>']
-
-vocab_transform = {}
-for ln in [SRC_LANGUAGE, TRG_LANGUAGE]:
-    # Create training data iterator for language
-    # train_iter_clone = Multi30k(split='train', language_pair=(SRC_LANGUAGE, TRG_LANGUAGE))
-    # Use the limited list for vocab building to be consistent if vocab is small
-    # However, it's generally better to build vocab on more data if available.
-    # For this specific request, let's build vocab on the limited set to ensure all tokens are seen.
-    # If building vocab on full data: train_iter_clone = Multi30k(split='train', language_pair=(SRC_LANGUAGE, TRG_LANGUAGE))
-    # For now, to ensure consistency with the 10k items, build vocab from the limited_train_list
-    # This requires yield_tokens to work with a list of tuples, not an iterator of tuples directly
-    # Modifying yield_tokens slightly for this or preparing the input to yield_tokens:
-    def yield_tokens_from_list(data_list, language):
-        language_index = {SRC_LANGUAGE: 0, TRG_LANGUAGE: 1}
-        for data_sample in data_list:
-            yield token_transform[language](data_sample[language_index[language]])
-
-    vocab_transform[ln] = build_vocab_from_iterator(
-        yield_tokens_from_list(full_train_list, ln), # Build vocab from the full training data
-        min_freq=1, # Min frequency for a token to be in vocab
-        specials=special_symbols,
-        special_first=True # Important: <unk> should be at index 0 if not specified otherwise
-    )
-    vocab_transform[ln].set_default_index(UNK_IDX)
-
-SRC_VOCAB_SIZE = len(vocab_transform[SRC_LANGUAGE])
-TGT_VOCAB_SIZE = len(vocab_transform[TRG_LANGUAGE])
-
-print(f"Source ({SRC_LANGUAGE}) Vocabulary Size: {SRC_VOCAB_SIZE}")
-print(f"Target ({TRG_LANGUAGE}) Vocabulary Size: {TGT_VOCAB_SIZE}")
-print(f"PAD_IDX: {PAD_IDX}, BOS_IDX: {BOS_IDX}, EOS_IDX: {EOS_IDX}, UNK_IDX: {UNK_IDX}")
-
-# --- Data Processing and DataLoader ---
-# Collate function to process batch of raw text strings
-from torch.nn.utils.rnn import pad_sequence
-
+# Collate function (expects batch_first=True for your Transformer)
 def collate_fn(batch):
     src_batch, tgt_batch = [], []
     for src_sample, tgt_sample in batch:
-        src_batch.append(torch.tensor(vocab_transform[SRC_LANGUAGE](token_transform[SRC_LANGUAGE](src_sample.rstrip("\n"))) , dtype=torch.long))
-        tgt_batch.append(torch.tensor(vocab_transform[TRG_LANGUAGE](token_transform[TRG_LANGUAGE](tgt_sample.rstrip("\n"))) , dtype=torch.long))
+        # Filter out very long sequences for faster training
+        if len(src_sample) <= MAX_SEQ_LEN and len(tgt_sample) <= MAX_SEQ_LEN:
+            src_batch.append(src_sample)
+            tgt_batch.append(tgt_sample)
+    
+    # Skip batch if all samples were filtered out
+    if not src_batch:
+        return None, None
+    
+    src_batch = pad_sequence(src_batch, padding_value=PAD_IDX, batch_first=True) 
+    tgt_batch = pad_sequence(tgt_batch, padding_value=PAD_IDX, batch_first=True)
+    return src_batch, tgt_batch
 
-    # Pad sequences
-    src_batch_padded = pad_sequence(src_batch, batch_first=True, padding_value=PAD_IDX)
-    tgt_batch_padded = pad_sequence(tgt_batch, batch_first=True, padding_value=PAD_IDX)
-    return src_batch_padded, tgt_batch_padded
-
-
-# train_dataloader = DataLoader(list(train_iter), batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-# val_dataloader = DataLoader(list(val_iter), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-train_dataloader = DataLoader(full_train_list, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-val_dataloader = DataLoader(full_val_list, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-# test_dataloader = DataLoader(list(test_iter), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-# --- Model, Optimizer, Loss ---
-model = Transformer(
+# --- Model, Loss, Optimizer ---
+transformer = Transformer(
     src_vocab_size=SRC_VOCAB_SIZE,
     tgt_vocab_size=TGT_VOCAB_SIZE,
-    d_model=D_MODEL,
+    d_model=EMB_SIZE,
     num_encoder_layers=NUM_ENCODER_LAYERS,
     num_decoder_layers=NUM_DECODER_LAYERS,
-    num_heads=NUM_HEADS,
-    d_ff=D_FF,
+    num_heads=NHEAD,
+    d_ff=FFN_HID_DIM,
     dropout=DROPOUT,
-    max_seq_len=MAX_SEQ_LEN
-).to(DEVICE)
+    max_seq_len=MAX_SEQ_LEN_CONFIG # Passed to PositionalEncoding within Transformer
+)
+transformer = transformer.to(DEVICE)
 
-# Initialize weights (already done in model constructor, but can be explicit)
-# for p in model.parameters():
-#     if p.dim() > 1:
-#         nn.init.xavier_uniform_(p)
+loss_fn = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+optimizer = torch.optim.Adam(transformer.parameters(), lr=LEARNING_RATE, betas=BETAS, eps=EPS)
 
-# Optimizer with learning rate schedule from the paper
-# lrate = d_model^−0.5 * min(step_num^−0.5, step_num * warmup_steps^−1.5)
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.98), eps=1e-9)
+# --- Training and Evaluation Functions ---
+# CRITICAL: Ensure your model.py's mask functions and Transformer.forward are compatible
+# with the mask creation logic below.
+# Assumptions:
+# - generate_square_subsequent_mask(sz, device) -> (sz, sz) boolean, True for allowed.
+# - create_padding_mask(seq, pad_idx, device) -> (B, 1, S) boolean, True for non-pad.
+# - Transformer.forward(src, tgt, src_mask, tgt_mask) expects:
+#   - src_mask: (B, 1, S_src) boolean, True for non-pad.
+#   - tgt_mask: (B, S_tgt, S_tgt) boolean, True for allowed (combined lookahead & padding).
 
-# Loss function - CrossEntropyLoss, ignoring padding
-# Label smoothing is mentioned in the paper (epsilon_ls = 0.1)
-# PyTorch CrossEntropyLoss has label_smoothing parameter (from v1.10.0)
-# criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=0.1)
-# For older PyTorch or manual implementation:
-class LabelSmoothingLoss(nn.Module):
-    def __init__(self, classes, padding_idx, smoothing=0.0, dim=-1):
-        super(LabelSmoothingLoss, self).__init__()
-        self.confidence = 1.0 - smoothing
-        self.smoothing = smoothing
-        self.cls = classes
-        self.padding_idx = padding_idx
-        self.dim = dim
-
-    def forward(self, pred, target):
-        pred = pred.log_softmax(dim=self.dim)
-        with torch.no_grad():
-            true_dist = torch.zeros_like(pred)
-            true_dist.fill_(self.smoothing / (self.cls - 2)) # -2 for pad and true class
-            true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
-            true_dist[:, self.padding_idx] = 0 # Mask padding
-            mask = torch.nonzero(target.data == self.padding_idx, as_tuple=False)
-            if mask.dim() > 0:
-                 true_dist.index_fill_(0, mask.squeeze(), 0.0)
-        return torch.mean(torch.sum(-true_dist * pred, dim=self.dim))
-
-# criterion = LabelSmoothingLoss(classes=TGT_VOCAB_SIZE, padding_idx=PAD_IDX, smoothing=0.1)
-# Using PyTorch's built-in for simplicity if available and correct version
-if hasattr(nn, 'CrossEntropyLoss') and 'label_smoothing' in nn.CrossEntropyLoss.__init__.__annotations__:
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=0.1)
-    print("Using PyTorch CrossEntropyLoss with label_smoothing.")
-else:
-    criterion = LabelSmoothingLoss(classes=TGT_VOCAB_SIZE, padding_idx=PAD_IDX, smoothing=0.1)
-    print("Using custom LabelSmoothingLoss.")
-
-
-# Learning rate scheduler function
-step_num_ = 0
-def lr_scheduler(step_num, d_model, warmup_steps):
-    step_num +=1 # 1-based step number
-    arg1 = step_num ** -0.5
-    arg2 = step_num * (warmup_steps ** -1.5)
-    return (d_model ** -0.5) * min(arg1, arg2)
-
-# --- Training and Evaluation Loop ---
-def train_epoch(model, dataloader, optimizer, criterion, current_epoch, total_epochs):
-    global step_num_
+def train_epoch(model, optimizer, criterion, train_dataloader):
     model.train()
-    total_loss = 0
-    start_time = time.time()
+    losses = 0
+    progress_bar = tqdm(train_dataloader, desc="Training Epoch", leave=False)
+    batch_count = 0
+    for src, tgt in progress_bar: 
+        # Skip filtered batches
+        if src is None or tgt is None:
+            continue
+            
+        src = src.to(DEVICE) # (B, S_src)
+        tgt = tgt.to(DEVICE) # (B, S_tgt)
 
-    for i, (src, tgt) in enumerate(dataloader):
-        step_num_ += 1
-        # Update learning rate based on the formula
-        new_lr = lr_scheduler(step_num_, D_MODEL, WARMUP_STEPS)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = new_lr
-
-        src = src.to(DEVICE)  # (B, S_src)
-        tgt = tgt.to(DEVICE)  # (B, S_tgt)
-
-        # Prepare target for loss calculation (decoder output shifted right)
-        # Input to decoder: <bos> w1 w2 ... wn
-        # Target for loss:   w1 w2 ... wn <eos>
         tgt_input = tgt[:, :-1] # (B, S_tgt-1)
-        tgt_output = tgt[:, 1:]  # (B, S_tgt-1)
-
+        
         # Create masks
-        src_padding_mask = create_padding_mask(src, PAD_IDX).to(DEVICE) # (B, 1, S_src)
-        tgt_padding_mask = create_padding_mask(tgt_input, PAD_IDX).to(DEVICE) # (B, 1, S_tgt-1)
-        tgt_look_ahead_mask = generate_square_subsequent_mask(tgt_input.size(1), device=DEVICE) # (S_tgt-1, S_tgt-1)
+        src_padding_mask = create_padding_mask(src, PAD_IDX, device=DEVICE) # (B, 1, S_src)
         
-        # Combine target masks: (B, S_tgt-1, S_tgt-1)
-        # Ensure masks are boolean for logical operations
-        combined_tgt_mask = (tgt_padding_mask.bool() & tgt_look_ahead_mask.bool()).to(DEVICE)
+        # Target masks
+        # look_ahead_mask: (S_tgt-1, S_tgt-1), True for allowed
+        tgt_seq_len = tgt_input.size(1)
+        bool_tgt_look_ahead_mask = generate_square_subsequent_mask(tgt_seq_len, device=DEVICE)
+        # padding_mask for target_input: (B, 1, S_tgt-1), True for non-pad
+        bool_tgt_padding_mask = create_padding_mask(tgt_input, PAD_IDX, device=DEVICE) 
+        
+        # Combine target masks for Transformer: (B, S_tgt-1, S_tgt-1)
+        # (B, 1, S_tgt-1) -> transpose to (B, S_tgt-1, 1)
+        # (B, S_tgt-1, 1) & (S_tgt-1, S_tgt-1) [broadcasts to (B, S_tgt-1, S_tgt-1)]
+        combined_tgt_mask = bool_tgt_padding_mask.transpose(1,2) & bool_tgt_look_ahead_mask.unsqueeze(0)
 
+        logits = model(src, tgt_input, src_padding_mask, combined_tgt_mask)
+        # logits shape: (B, S_tgt-1, TGT_VOCAB_SIZE)
+        
         optimizer.zero_grad()
-        preds = model(src, tgt_input, src_padding_mask, combined_tgt_mask) # (B, S_tgt-1, V_tgt)
-        
-        # Reshape for CrossEntropyLoss: (N, C) where N = B * (S_tgt-1), C = V_tgt
-        loss = criterion(preds.reshape(-1, preds.size(-1)), tgt_output.reshape(-1))
+        tgt_out = tgt[:, 1:] # (B, S_tgt-1)
+        loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
         optimizer.step()
+        losses += loss.item()
+        batch_count += 1
+        progress_bar.set_postfix(loss=f"{loss.item():.4f}")
         
-        total_loss += loss.item()
+    return losses / max(batch_count, 1) # Avoid division by zero
 
-        if (i + 1) % 50 == 0: # Log every 50 batches
-            avg_batch_loss = loss.item()
-            print(f"Epoch [{current_epoch+1}/{total_epochs}], Batch [{i+1}/{len(dataloader)}], "
-                  f"LR: {new_lr:.2e}, Batch Loss: {avg_batch_loss:.4f}")
-            mlflow.log_metric("train_batch_loss", avg_batch_loss, step=step_num_)
-            mlflow.log_metric("learning_rate", new_lr, step=step_num_)
-
-    epoch_loss = total_loss / len(dataloader)
-    end_time = time.time()
-    epoch_duration = end_time - start_time
-    print(f"Epoch [{current_epoch+1}/{total_epochs}] completed. Train Loss: {epoch_loss:.4f}. Duration: {epoch_duration:.2f}s")
-    return epoch_loss, epoch_duration
-
-def evaluate(model, dataloader, criterion):
+def evaluate(model, criterion, val_dataloader):
     model.eval()
-    total_loss = 0
+    losses = 0
+    batch_count = 0
+    progress_bar = tqdm(val_dataloader, desc="Evaluating", leave=False)
     with torch.no_grad():
-        for src, tgt in dataloader:
+        for src, tgt in progress_bar:
+            # Skip filtered batches
+            if src is None or tgt is None:
+                continue
+                
             src = src.to(DEVICE)
             tgt = tgt.to(DEVICE)
-
             tgt_input = tgt[:, :-1]
-            tgt_output = tgt[:, 1:]
 
-            src_padding_mask = create_padding_mask(src, PAD_IDX).to(DEVICE)
-            tgt_padding_mask = create_padding_mask(tgt_input, PAD_IDX).to(DEVICE)
-            tgt_look_ahead_mask = generate_square_subsequent_mask(tgt_input.size(1), device=DEVICE)
-            # Ensure masks are boolean for logical operations
-            combined_tgt_mask = (tgt_padding_mask.bool() & tgt_look_ahead_mask.bool()).to(DEVICE)
-
-            preds = model(src, tgt_input, src_padding_mask, combined_tgt_mask)
-            loss = criterion(preds.reshape(-1, preds.size(-1)), tgt_output.reshape(-1))
-            total_loss += loss.item()
+            src_padding_mask = create_padding_mask(src, PAD_IDX, device=DEVICE)
             
-    return total_loss / len(dataloader)
-
-# --- MLflow Setup ---
-try:
-    experiment = mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME)
-    if experiment is None:
-        experiment_id = mlflow.create_experiment(MLFLOW_EXPERIMENT_NAME)
-    else:
-        experiment_id = experiment.experiment_id
-except mlflow.exceptions.MlflowException as e:
-    print(f"MLflow setup error: {e}. Ensure MLflow server is running or configured correctly.")
-    # Fallback if MLflow is not available or experiment creation fails
-    class DummyMLflow:
-        def __init__(self):
-            self.experiment_id = "local_run"
-        def start_run(self, experiment_id=None, run_name=None): return self
-        def __enter__(self): return self
-        def __exit__(self, type, value, traceback): pass
-        def log_param(self, key, value): print(f"MLflow (dummy): Param {key}={value}")
-        def log_metric(self, key, value, step=None): print(f"MLflow (dummy): Metric {key}={value} at step {step}")
-        def pytorch_log_model(self, model, artifact_path): print(f"MLflow (dummy): Model logged to {artifact_path}")
-        def end_run(self): print("MLflow (dummy): Run ended")
-    mlflow = DummyMLflow()
-    experiment_id = mlflow.experiment_id
+            tgt_seq_len = tgt_input.size(1)
+            bool_tgt_look_ahead_mask = generate_square_subsequent_mask(tgt_seq_len, device=DEVICE)
+            bool_tgt_padding_mask = create_padding_mask(tgt_input, PAD_IDX, device=DEVICE)
+            combined_tgt_mask = bool_tgt_padding_mask.transpose(1,2) & bool_tgt_look_ahead_mask.unsqueeze(0)
+            
+            logits = model(src, tgt_input, src_padding_mask, combined_tgt_mask)
+            
+            tgt_out = tgt[:, 1:]
+            loss = criterion(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1))
+            losses += loss.item()
+            batch_count += 1
+            progress_bar.set_postfix(loss=f"{loss.item():.4f}")
+            
+    return losses / max(batch_count, 1) # Avoid division by zero
 
 # --- Main Training Loop ---
 if __name__ == "__main__":
     print(f"Using device: {DEVICE}")
-    print(f"Source Language: {SRC_LANGUAGE}, Target Language: {TRG_LANGUAGE}")
-    print(f"Model Hyperparameters: d_model={D_MODEL}, heads={NUM_HEADS}, enc_layers={NUM_ENCODER_LAYERS}, dec_layers={NUM_DECODER_LAYERS}, d_ff={D_FF}")
-    print(f"Training Hyperparameters: epochs={EPOCHS}, batch_size={BATCH_SIZE}, warmup_steps={WARMUP_STEPS}")
+    
+    # Verify that your mask functions in model.py are boolean and compatible:
+    # generate_square_subsequent_mask(sz, device) -> (sz, sz) boolean, True for allowed positions.
+    # create_padding_mask(seq, pad_idx, device) -> (B, 1, S) boolean, True for non-pad tokens.
+    # If they are not, you MUST adjust them in model.py or the mask combination logic above.
 
-    with mlflow.start_run(experiment_id=experiment_id, run_name="Transformer_TrainingRun") as run:
-        mlflow.log_param("src_language", SRC_LANGUAGE)
-        mlflow.log_param("tgt_language", TRG_LANGUAGE)
-        mlflow.log_param("d_model", D_MODEL)
-        mlflow.log_param("num_encoder_layers", NUM_ENCODER_LAYERS)
-        mlflow.log_param("num_decoder_layers", NUM_DECODER_LAYERS)
-        mlflow.log_param("num_heads", NUM_HEADS)
-        mlflow.log_param("d_ff", D_FF)
-        mlflow.log_param("dropout", DROPOUT)
-        mlflow.log_param("max_seq_len", MAX_SEQ_LEN)
-        mlflow.log_param("batch_size", BATCH_SIZE)
-        mlflow.log_param("initial_learning_rate_adam", LEARNING_RATE) # Adam LR is just initial
-        mlflow.log_param("warmup_steps", WARMUP_STEPS)
-        mlflow.log_param("epochs", EPOCHS)
-        mlflow.log_param("src_vocab_size", SRC_VOCAB_SIZE)
-        mlflow.log_param("tgt_vocab_size", TGT_VOCAB_SIZE)
-        mlflow.log_param("pad_idx", PAD_IDX)
-        mlflow.log_param("bos_idx", BOS_IDX)
-        mlflow.log_param("eos_idx", EOS_IDX)
-        mlflow.log_param("unk_idx", UNK_IDX)
+    print("Preparing data loaders using WMT14 from Hugging Face...")
+    # WMT14 'validation' split is often newstest2013. 'test' is often newstest2014.
+    # Check dataset.column_names or dataset['train'].features for exact structure if issues arise.
+    train_hf_split = wmt_dataset.get('train')
+    val_hf_split = wmt_dataset.get('validation')
 
-        best_val_loss = float('inf')
-        total_training_time = 0
+    if not train_hf_split:
+        print("ERROR: 'train' split not found in the loaded WMT14 dataset.")
+        exit(1)
+    if not val_hf_split:
+        print("ERROR: 'validation' split not found in the loaded WMT14 dataset. Using a subset of train for validation.")
+        # Fallback: split train if validation is missing (not ideal for WMT14)
+        # This is a placeholder, proper WMT validation set is preferred.
+        full_train_len = len(train_hf_split)
+        train_len = int(0.95 * full_train_len)
+        val_len = full_train_len - train_len
+        # Note: This simple split might not be directly supported by HF dataset object like this.
+        # For simplicity, if 'validation' is missing, this script will error out unless you implement
+        # a more robust splitting mechanism for HF datasets or ensure 'validation' split exists.
+        # For now, we assume 'validation' split exists.
+        print("Ensure your WMT14 dataset from Hugging Face has a 'validation' split.")
 
-        for epoch in range(EPOCHS):
-            print(f"--- Epoch {epoch+1}/{EPOCHS} ---")
-            train_loss, epoch_duration = train_epoch(model, train_dataloader, optimizer, criterion, epoch, EPOCHS)
-            val_loss = evaluate(model, val_dataloader, criterion)
-            total_training_time += epoch_duration
 
-            print(f"Epoch {epoch+1} Summary: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Duration: {epoch_duration:.2f}s")
-            mlflow.log_metric("train_epoch_loss", train_loss, step=epoch+1)
-            mlflow.log_metric("val_epoch_loss", val_loss, step=epoch+1)
-            mlflow.log_metric("epoch_duration_seconds", epoch_duration, step=epoch+1)
+    # Limit dataset sizes for faster experimentation
+    print("Limiting dataset sizes for faster training...")
+    train_hf_split = limit_dataset_size(train_hf_split, MAX_SAMPLES_TRAIN)
+    val_hf_split = limit_dataset_size(val_hf_split, MAX_SAMPLES_VAL)
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                # Save the best model
-                mlflow.pytorch.log_model(model, "best_transformer_model")
-                torch.save(model.state_dict(), "transformer_best_model.pt")
-                print(f"New best model saved with validation loss: {best_val_loss:.4f}")
+    train_dataset = HFTranslationDataset(train_hf_split, SRC_LANGUAGE, TGT_LANGUAGE, text_transform_src, text_transform_tgt)
+    val_dataset = HFTranslationDataset(val_hf_split, SRC_LANGUAGE, TGT_LANGUAGE, text_transform_src, text_transform_tgt)
+
+    # Using num_workers=0 to avoid multiprocessing pickle errors with local functions
+    # pin_memory is beneficial for CUDA and MPS transfers
+    use_pin_memory = DEVICE.type in ['cuda', 'mps']
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn, shuffle=True, num_workers=0, pin_memory=use_pin_memory)
+    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn, num_workers=0, pin_memory=use_pin_memory)
+    
+    print(f"Training data loader: {len(train_dataloader)} batches of size {BATCH_SIZE}")
+    print(f"Validation data loader: {len(val_dataloader)} batches of size {BATCH_SIZE}")
+
+    print("Starting training with WMT14 data...")
+    for epoch in range(1, NUM_EPOCHS + 1):
+        start_time = time.time()
+        train_loss = train_epoch(transformer, optimizer, loss_fn, train_dataloader)
+        end_time = time.time()
+        val_loss = evaluate(transformer, loss_fn, val_dataloader)
         
-        mlflow.log_metric("total_training_time_seconds", total_training_time)
-        mlflow.pytorch.log_model(model, "final_transformer_model") # Log final model
-        torch.save(model.state_dict(), "transformer_final_model.pt")
-        print("Training finished.")
-        print(f"Best validation loss: {best_val_loss:.4f}")
-        print(f"Total training time: {total_training_time/3600:.2f} hours")
+        epoch_duration_mins, epoch_duration_secs = divmod(end_time - start_time, 60)
+        
+        print(f"Epoch: {epoch:02}/{NUM_EPOCHS} | Time: {epoch_duration_mins:.0f}m {epoch_duration_secs:.0f}s")
+        print(f"\tTrain Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}")
+        print(f"\t Val. Loss: {val_loss:.3f} |  Val. PPL: {math.exp(val_loss):7.3f}")
+        
+        current_model_save_path = MODEL_SAVE_PATH.format(epoch=epoch)
+        try:
+            torch.save(transformer.state_dict(), current_model_save_path)
+            print(f"Saved model checkpoint to {current_model_save_path}")
+        except Exception as e:
+            print(f"Error saving model checkpoint: {e}")
 
-    # TODO: Add BLEU score calculation for benchmarking
-    # TODO: Add example translation function
-    # TODO: Add Streamlit app integration
+    print("Training complete.")
