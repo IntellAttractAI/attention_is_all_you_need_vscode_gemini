@@ -108,7 +108,7 @@ def load_hf_vocabs():
         with open(vocab_tgt_path, 'r') as f:
             vocab_tgt_data = json.load(f)
         
-        # Create simple vocabulary classes
+        # Create simple vocabulary classes (like app_local.py)
         class SimpleVocab:
             def __init__(self, vocab_data):
                 self.stoi = vocab_data['stoi']
@@ -184,13 +184,6 @@ def load_model_from_hf():
         st.error("Cannot load model: Configuration from Hugging Face is missing or incomplete (vocab sizes).")
         return None
 
-# --- Load Model from Hugging Face (with local trained weights) ---
-@st.cache_resource 
-def load_model_from_hf():
-    if not hf_config or not SRC_VOCAB_SIZE or not TGT_VOCAB_SIZE:
-        st.error("Cannot load model: Configuration from Hugging Face is missing or incomplete (vocab sizes).")
-        return None
-
     # Download model.py from HuggingFace to get the model architecture
     try:
         model_py_path = hf_hub_download(repo_id=HF_REPO_ID, filename=MODEL_FILENAME)
@@ -211,27 +204,15 @@ def load_model_from_hf():
         max_seq_len=MAX_SEQ_LEN
     ).to(DEVICE)
 
-    # Load trained model weights from local file (same as app_local.py)
-    local_model_path = "transformer_model_wmt14_epoch_3.pth"
-    if os.path.exists(local_model_path):
-        try:
-            state_dict = torch.load(local_model_path, map_location=DEVICE)
-            model.load_state_dict(state_dict)
-            model.eval()
-            st.success(f"Model loaded with trained weights from {local_model_path}")
-            print(f"Model loaded with trained weights from {local_model_path}")
-        except Exception as e:
-            st.error(f"Error loading trained weights: {e}")
-            st.warning("Using randomly initialized weights instead.")
-    else:
-        st.warning(f"Trained model file {local_model_path} not found. Using randomly initialized weights.")
-        st.warning("Note: This model uses randomly initialized weights. For actual translation, you would need to load trained model weights.")
-    
+    # Since we don't have a pre-trained model checkpoint, initialize with random weights
+    # In a real scenario, you would load actual trained weights here
+    model.eval()
+    print(f"Model architecture loaded from Hugging Face: {HF_REPO_ID}")
+    st.warning("Note: This model uses randomly initialized weights. For actual translation, you would need to load trained model weights.")
     return model
 
 transformer_model = load_model_from_hf() # Changed from load_model()
 
-# --- Translation Function ---
 # --- Translation Function (Simplified like app_local.py) ---
 def translate_sentence(model, sentence: str, src_lang: str, tgt_lang: str, 
                        max_length: int = 50) -> str:
@@ -301,135 +282,6 @@ def translate_sentence(model, sentence: str, src_lang: str, tgt_lang: str,
     
     return final_translation
 
-    for _ in range(max_output_len):
-        new_beams = []
-        all_candidates = [] # Stores (score, sequence) for this step
-
-        for current_seq_list, current_score in beams:
-            if current_seq_list[-1] == EOS_IDX:
-                # This hypothesis is complete
-                completed_hypotheses.append((current_seq_list, current_score))
-                # Prune this beam if it's already longer than others or if we have enough completed
-                if len(completed_hypotheses) >= beam_width * 2 : # Heuristic to stop early if many completed
-                    continue 
-                # Don't expand completed hypotheses further
-                # Add it to new_beams to keep it if it's still among the best,
-                # but it won't be expanded. Or better, handle completed ones separately.
-                continue # Skip expansion for completed ones
-
-            tgt_tensor = torch.LongTensor(current_seq_list).unsqueeze(0).to(DEVICE) # (1, current_tgt_len)
-            tgt_look_ahead_mask = generate_square_subsequent_mask(tgt_tensor.size(1), device=DEVICE)
-
-            # print(f"[app.py BS] Current sequence: {vocab_transform[tgt_lang].lookup_tokens(current_seq_list)}")
-            # print(f"[app.py BS] tgt_tensor shape: {tgt_tensor.shape}")
-            # print(f"[app.py BS] tgt_look_ahead_mask shape: {tgt_look_ahead_mask.shape}")
-            # print(f"[app.py BS] src_padding_mask (memory_key_padding_mask) shape: {src_padding_mask.shape}")
-
-            decoder_output = model.decode(tgt_tensor, memory, tgt_look_ahead_mask, src_padding_mask)
-            # decoder_output shape: (1, current_tgt_len, d_model)
-            
-            next_token_logits = model.generator(decoder_output[:, -1, :]) # (1, tgt_vocab_size)
-            next_token_log_probs = torch.log_softmax(next_token_logits, dim=-1) # (1, tgt_vocab_size)
-            
-            # Get top k next tokens
-            top_k_log_probs, top_k_indices = torch.topk(next_token_log_probs, beam_width, dim=-1)
-
-            for k_idx in range(beam_width):
-                next_tok_id = top_k_indices[0, k_idx].item()
-                log_prob = top_k_log_probs[0, k_idx].item()
-                
-                new_seq_list = current_seq_list + [next_tok_id]
-                new_score = current_score + log_prob
-                all_candidates.append((new_seq_list, new_score))
-
-        # Add completed hypotheses from previous step to candidates to compete for pruning
-        # This ensures completed ones are not unfairly dropped if their score is high
-        for ch_seq, ch_score in completed_hypotheses:
-             # Only add if not already added or if we want to re-evaluate them (e.g. with length penalty later)
-             # For now, completed_hypotheses are final unless we want to allow them to be "un-completed"
-             # Let's keep completed_hypotheses separate and only prune from active beams.
-             pass
-
-
-        if not all_candidates: # No new candidates generated (e.g., all beams ended)
-            break
-
-        # Sort all candidates by score (higher is better) and select top beam_width
-        # all_candidates is list of (sequence_list, score)
-        ordered_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
-        beams = ordered_candidates[:beam_width]
-
-        # Check if all active beams now end in EOS
-        if all(b[0][-1] == EOS_IDX for b in beams):
-            completed_hypotheses.extend(beams) # Add them all
-            break # Stop if all active beams are complete
-
-    # After the loop, add any remaining beams to completed_hypotheses
-    # These might not have ended with EOS if max_output_len was reached
-    for b_seq, b_score in beams:
-        is_already_completed = any(ch_seq == b_seq for ch_seq, _ in completed_hypotheses)
-        if not is_already_completed:
-            completed_hypotheses.append((b_seq, b_score))
-            
-    if not completed_hypotheses:
-        # Fallback: if no hypothesis was ever completed (e.g. beam_width=0 or error)
-        # Or if all beams were empty from the start.
-        # This case should ideally not be reached if beams start with BOS_IDX.
-        # If beams is not empty, use the best one from there.
-        if beams and beams[0][0]:
-             completed_hypotheses.extend(beams)
-        else: # Truly no hypothesis
-            return " " # Return empty or error message
-
-
-    # Apply length penalty and select the best hypothesis
-    # lp(Y) = ((5 + |Y|) / (5 + 1))^alpha
-    # We want to maximize score / lp(Y)
-    best_hypothesis_seq = None
-    best_adjusted_score = -float('inf')
-
-    for seq_list, score in completed_hypotheses:
-        if not seq_list: continue # Skip empty sequences if any
-        
-        # Calculate length penalty
-        # Exclude BOS from length for penalty calculation, include EOS if present
-        effective_len = len(seq_list) - 1 # -1 for BOS
-        if seq_list[-1] == EOS_IDX:
-            effective_len -=1 # -1 for EOS if we don't want to penalize its presence for length
-
-        if effective_len <= 0: effective_len = 1 # Avoid division by zero or negative powers for very short seqs
-
-        penalty = ((5.0 + float(effective_len)) / (5.0 + 1.0)) ** length_penalty_alpha
-        
-        adjusted_score = score / penalty if penalty != 0 else score # score can be negative (log_prob)
-
-        # print(f"[app.py BS] Candidate: {vocab_transform[tgt_lang].lookup_tokens(seq_list)} Score: {score:.4f}, Len: {effective_len}, Penalty: {penalty:.4f}, AdjScore: {adjusted_score:.4f}")
-
-        if adjusted_score > best_adjusted_score:
-            best_adjusted_score = adjusted_score
-            best_hypothesis_seq = seq_list
-            
-    if best_hypothesis_seq is None and completed_hypotheses: # Fallback if all scores were -inf or no valid seq
-        best_hypothesis_seq = sorted(completed_hypotheses, key=lambda x: x[1], reverse=True)[0][0]
-    elif best_hypothesis_seq is None:
-        return "[Beam search found no suitable translation]"
-
-
-    # Convert numerical tokens back to text
-    # Remove BOS token (first token)
-    output_tokens_numerical = best_hypothesis_seq[1:] 
-    
-    # Remove EOS token if it's the last token
-    if output_tokens_numerical and output_tokens_numerical[-1] == EOS_IDX:
-        output_tokens_numerical = output_tokens_numerical[:-1]
-        
-    translated_tokens = vocab_transform[tgt_lang].lookup_tokens(output_tokens_numerical)
-    final_translation = " ".join(translated_tokens)
-    
-    # Debug: Print chosen translation
-    # print(f"[app.py BS] Final Chosen Translation: \'{final_translation}\', Raw_Seq: {best_hypothesis_seq}")
-    return final_translation
-
 # --- Streamlit UI ---
 st.title("Transformer Machine Translation (Attention Is All You Need)")
 # Dynamically display languages from loaded config
@@ -453,10 +305,6 @@ else:
     st.sidebar.markdown(f"**Device:** {DEVICE}")
 
     st.header("Try it out!")
-    
-    # Warning about model limitations
-    st.warning("⚠️ **Model Limitation Notice**: This model has only been trained for 3 epochs and produces very limited output patterns. This is a demonstration of the transformer architecture rather than a production-ready translation system. For meaningful translations, the model would need significantly more training epochs.")
-    
     default_text = "Eine Katze saß auf der Matte."
     source_text = st.text_area(f"Enter {SRC_LANGUAGE.upper()} text to translate:", default_text, height=100)
 
@@ -494,4 +342,4 @@ st.markdown("---")
 st.write("Note: This model is trained on the Multi30k dataset, hosted on Hugging Face.")
 st.write(f"Ensure the repository {HF_REPO_ID} contains the necessary model, config, and vocabulary files.")
 
-# To run: streamlit run app.py
+# To run: streamlit run app_fixed.py

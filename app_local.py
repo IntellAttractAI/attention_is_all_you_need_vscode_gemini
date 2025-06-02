@@ -229,6 +229,9 @@ else:
     # Main interface
     st.header("✨ Try Translation")
     
+    # Warning about model limitations
+    st.warning("⚠️ **Model Limitation Notice**: This model has only been trained for 3 epochs and produces very limited output patterns. This is a demonstration of the transformer architecture rather than a production-ready translation system. For meaningful translations, the model would need significantly more training epochs.")
+    
     # Default examples
     default_examples = {
         "de": [
