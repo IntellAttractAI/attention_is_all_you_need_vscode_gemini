@@ -1,7 +1,16 @@
 
 # attention_is_all_you_need_de_en_wmt14
 
-This is a Transformer model for machine translation from de to en, based on the "Attention Is All You Need" paper.
+This is a **demonstration** Transformer model for machine translation from de to en, based on the "Attention Is All You Need" paper.
+
+## ⚠️ Important Limitation Notice
+
+**This model has only been trained for 3 epochs and produces very limited output patterns.** This is a demonstration of the transformer architecture rather than a production-ready translation system.
+
+### Expected Behavior:
+- The model will produce short, repetitive phrases like "The Union ." or "We have ." regardless of the input
+- This is due to insufficient training (only 3 epochs vs. hundreds typically needed)
+- The model architecture is correct, but the weights have not converged to meaningful translation patterns
 
 ## Model Details
 
